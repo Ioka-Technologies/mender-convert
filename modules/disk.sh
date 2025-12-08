@@ -189,9 +189,16 @@ disk_boot_part() {
     #
     # We also need to adjust the part number of the rootfs part depending on if
     # boot part was extracted or generated.
+    #
+    # MENDER_SOURCE_BOOT_PART_NUMBER can be set to override which partition
+    # number from the source image should be used as the boot partition.
     boot_part="work/boot-generated.vfat"
     if [ ! -f ${boot_part} ]; then
-        boot_part="work/part-1.fs"
+        if [ -n "${MENDER_SOURCE_BOOT_PART_NUMBER:-}" ]; then
+            boot_part="work/part-${MENDER_SOURCE_BOOT_PART_NUMBER}.fs"
+        else
+            boot_part="work/part-1.fs"
+        fi
     fi
     echo "${boot_part}"
 }
@@ -199,11 +206,17 @@ disk_boot_part() {
 # Print path to the root partition filesystem image
 #
 disk_root_part() {
-    boot_part="work/boot-generated.vfat"
-    if [ ! -f ${boot_part} ]; then
-        root_part="work/part-2.fs"
+    # MENDER_SOURCE_ROOT_PART_NUMBER can be set to override which partition
+    # number from the source image should be used as the root partition.
+    if [ -n "${MENDER_SOURCE_ROOT_PART_NUMBER:-}" ]; then
+        root_part="work/part-${MENDER_SOURCE_ROOT_PART_NUMBER}.fs"
     else
-        root_part="work/part-1.fs"
+        boot_part="work/boot-generated.vfat"
+        if [ ! -f ${boot_part} ]; then
+            root_part="work/part-2.fs"
+        else
+            root_part="work/part-1.fs"
+        fi
     fi
     echo "${root_part}"
 }
@@ -313,7 +326,7 @@ disk_get_device_part_number() {
         /dev/mmcblk*p*)
             dev_part=$(echo $1 | cut -dp -f2)
             ;;
-        /dev/[sh]d[a-z][1-9]*)
+        /dev/[shv]d[a-z][1-9]*)
             dev_part=${1##*d[a-z]}
             ;;
         ubi*_*)
@@ -349,7 +362,7 @@ disk_get_device_base() {
         /dev/mmcblk*p*)
             dev_base=$(echo $1 | cut -dp -f1)
             ;;
-        /dev/[sh]d[a-z]*)
+        /dev/[shv]d[a-z]*)
             dev_base=${1%%[1-9]*}
             ;;
         ubi*_*)
