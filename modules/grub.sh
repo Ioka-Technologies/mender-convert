@@ -60,7 +60,7 @@ set bootargs="${MENDER_GRUB_KERNEL_BOOT_ARGS}"
 EOF
     fi
 
-    (   
+    (
         cd work/grub-mender-grubenv-${MENDER_GRUBENV_VERSION}
         run_and_log_cmd "make 2>&1"
         run_and_log_cmd "sudo make DESTDIR=$PWD/../ BOOT_DIR=boot install-standalone-boot-files"
@@ -90,19 +90,32 @@ function grub_install_grub_d_config() {
     fi
     run_and_log_cmd "sudo ln -s efi/grub-mender-grubenv work/rootfs/boot/grub"
 
-    (   
+    log_info "DEBUG: work/boot/ contents BEFORE make install-boot-env:"
+    run_and_log_cmd "sudo find work/boot -maxdepth 2 -ls || true"
+
+    (
         cd work/grub-mender-grubenv-${MENDER_GRUBENV_VERSION}
         run_and_log_cmd "make 2>&1"
+        log_info "DEBUG: Running make install-boot-env..."
         run_and_log_cmd "sudo make DESTDIR=$PWD/../ BOOT_DIR=boot install-boot-env"
+        log_info "DEBUG: Checking what make install-boot-env created in build dir:"
+        run_and_log_cmd "sudo find $PWD/../boot -ls || true"
         run_and_log_cmd "sudo make DESTDIR=$PWD/../rootfs install-grub.d-boot-scripts"
         run_and_log_cmd "sudo make DESTDIR=$PWD/../rootfs install-tools"
         # We need this for running the scripts once.
         run_and_log_cmd "sudo make DESTDIR=$PWD/../rootfs install-offline-files"
     )
 
+    log_info "DEBUG: work/boot/ contents AFTER make install-boot-env:"
+    run_and_log_cmd "sudo find work/boot -maxdepth 3 -ls || true"
+    log_info "DEBUG: Checking work/boot/grub-mender-grubenv specifically:"
+    run_and_log_cmd "sudo find work/boot/grub-mender-grubenv -ls || true"
+    log_info "DEBUG: Checking if files ended up in work/boot/grub/ instead:"
+    run_and_log_cmd "sudo find work/boot/grub -ls 2>/dev/null || true"
+
     run_with_chroot_setup work/rootfs grub_install_in_chroot
 
-    (   
+    (
         cd work/grub-mender-grubenv-${MENDER_GRUBENV_VERSION}
         # Should be removed after running.
         run_and_log_cmd "sudo make DESTDIR=$PWD/../rootfs uninstall-offline-files"
@@ -118,6 +131,243 @@ function grub_install_in_chroot() {
     run_in_chroot_and_log_cmd work/rootfs "grub-install --target=${target_name} --removable --no-nvram"
     run_in_chroot_and_log_cmd work/rootfs "grub-install --target=${target_name} --no-nvram"
     run_in_chroot_and_log_cmd work/rootfs "update-grub"
+}
+
+# grub_modify_boot_partition_grubcfg
+#
+# Modifies grub.cfg files in a boot partition directory to load grubenv from BOOT partition
+# This is used for both initial setup and slot tarball generation (DRY principle)
+#
+# Arguments:
+#   $1 - Path to boot partition directory (e.g., work/boot_a)
+#   $2 - Distro name (e.g., "debian")
+function grub_modify_boot_partition_grubcfg() {
+    local boot_dir="${1}"
+    local distro_name="${2}"
+
+    log_info "Modifying grub.cfg in ${boot_dir} to load grubenv from BOOT partition"
+
+    # Create the grubenv loader snippet
+    cat > work/grubenv_loader.txt <<'EOF'
+# Load grubenv from BOOT partition (partition 1)
+search --no-floppy --set=grubenv_dev --label BOOT
+EOF
+
+    # Prepend to all grub.cfg files in this boot partition
+    run_and_log_cmd "sudo sh -c 'cat work/grubenv_loader.txt ${boot_dir}/EFI/${distro_name}/grub.cfg > work/grub_tmp.cfg && mv work/grub_tmp.cfg ${boot_dir}/EFI/${distro_name}/grub.cfg'"
+    run_and_log_cmd "sudo sh -c 'cat work/grubenv_loader.txt ${boot_dir}/EFI/BOOT/grub.cfg > work/grub_tmp.cfg && mv work/grub_tmp.cfg ${boot_dir}/EFI/BOOT/grub.cfg'"
+
+    # Modify mender_setup_env_location function to use grubenv_dev instead of root
+    # This ensures grubenv is always accessed from BOOT partition, not BOOT_A/BOOT_B
+    run_and_log_cmd "sudo sed -i 's|\${root})/grub-mender-grubenv|\${grubenv_dev})/grub-mender-grubenv|g' ${boot_dir}/EFI/${distro_name}/grub.cfg"
+    run_and_log_cmd "sudo sed -i 's|\${root})/grub-mender-grubenv|\${grubenv_dev})/grub-mender-grubenv|g' ${boot_dir}/EFI/BOOT/grub.cfg"
+
+    run_and_log_cmd "rm work/grubenv_loader.txt"
+}
+
+# grub_setup_ab_esp_partitions
+#
+# Setup A/B boot partitions with chainloader on primary BOOT partition
+# This implements the A/B boot architecture without requiring persistent efivars/efibootmgr
+function grub_setup_ab_esp_partitions() {
+    log_info "Setting up A/B boot partitions with chainloader architecture"
+
+    # Find the distro EFI directory (any directory that's not BOOT/boot)
+    local distro_efi_dir=""
+    for dir in work/boot/EFI/*/; do
+        if [ -d "$dir" ]; then
+            local dirname=$(basename "$dir")
+            if [ "$dirname" != "BOOT" ] && [ "$dirname" != "boot" ]; then
+                distro_efi_dir="$dir"
+                log_info "Found distro EFI directory: $distro_efi_dir"
+                break
+            fi
+        fi
+    done
+
+    if [ -z "$distro_efi_dir" ] || [ ! -d "$distro_efi_dir" ]; then
+        log_fatal "Could not find distro EFI directory (expected non-BOOT directory in /EFI/)"
+    fi
+
+    # Determine distro name (e.g., "debian") and EFI binary name
+    local distro_name=$(basename "$distro_efi_dir")
+    log_info "Distro EFI directory name: $distro_name"
+
+    local efi_target_name=$(probe_grub_efi_target_name)  # BOOTAA64.EFI or BOOTX64.EFI
+    local efi_binary_name=$(echo "${efi_target_name}" | sed 's/BOOT/grub/I')  # grubaa64.efi or grubx64.efi
+
+    # Create BOOT, BOOT_A, and BOOT_B directories (all ESP partitions)
+    log_info "Creating BOOT, BOOT_A, and BOOT_B directory structures"
+    run_and_log_cmd "sudo mkdir -p work/boot_main/EFI/${distro_name}"
+    run_and_log_cmd "sudo mkdir -p work/boot_main/EFI/BOOT"
+    run_and_log_cmd "sudo mkdir -p work/boot_a/EFI/${distro_name}"
+    run_and_log_cmd "sudo mkdir -p work/boot_a/EFI/BOOT"
+    run_and_log_cmd "sudo mkdir -p work/boot_b/EFI/${distro_name}"
+    run_and_log_cmd "sudo mkdir -p work/boot_b/EFI/BOOT"
+
+    # Copy complete EFI folder to all three partitions
+    log_info "Copying EFI folder to BOOT, BOOT_A, and BOOT_B"
+    run_and_log_cmd "sudo cp -r ${distro_efi_dir}/* work/boot_main/EFI/${distro_name}/"
+    run_and_log_cmd "sudo cp -r ${distro_efi_dir}/* work/boot_a/EFI/${distro_name}/"
+    run_and_log_cmd "sudo cp -r ${distro_efi_dir}/* work/boot_b/EFI/${distro_name}/"
+
+    # Create UEFI fallback boot paths
+    log_info "Creating UEFI fallback boot paths with ${efi_target_name}"
+    run_and_log_cmd "sudo cp work/boot_main/EFI/${distro_name}/${efi_binary_name} work/boot_main/EFI/BOOT/${efi_target_name}"
+    run_and_log_cmd "sudo cp work/boot_a/EFI/${distro_name}/${efi_binary_name} work/boot_a/EFI/BOOT/${efi_target_name}"
+    run_and_log_cmd "sudo cp work/boot_b/EFI/${distro_name}/${efi_binary_name} work/boot_b/EFI/BOOT/${efi_target_name}"
+
+    # Copy Mender grubenv to BOOT partition
+    # Note: work/boot is still mounted from mender-convert-modify
+    log_info "DEBUG: Checking for grubenv directory..."
+    run_and_log_cmd "ls -la work/boot/ | grep grub || true"
+
+    if [ -d work/boot/grub-mender-grubenv ]; then
+        log_info "Copying grub-mender-grubenv to BOOT partition"
+        log_info "DEBUG: Contents of work/boot/grub-mender-grubenv before copy:"
+        run_and_log_cmd "sudo find work/boot/grub-mender-grubenv -ls || true"
+        run_and_log_cmd "sudo cp -r work/boot/grub-mender-grubenv work/boot_main/"
+        log_info "DEBUG: Contents of work/boot_main/grub-mender-grubenv after copy:"
+        run_and_log_cmd "sudo find work/boot_main/grub-mender-grubenv -ls || true"
+    else
+        log_warn "grub-mender-grubenv not found in work/boot/"
+        log_info "DEBUG: Listing work/boot contents:"
+        run_and_log_cmd "sudo find work/boot -maxdepth 2 -ls || true"
+    fi
+
+    # Create chainloader grub.cfg on BOOT partition
+    log_info "Creating chainloader grub.cfg on BOOT partition"
+    sudo tee work/boot_main/EFI/${distro_name}/grub.cfg > /dev/null <<EOF
+# BOOT Partition Chainloader Configuration
+# Loads grubenv and chainloads to BOOT_A or BOOT_B based on mender_boot_part
+echo "BOOT: Loading grubenv and determining boot partition..."
+
+# Load grubenv from this partition (BOOT)
+search --no-floppy --set=bootenv_dev --label BOOT
+load_env --skip-sig -f (\${bootenv_dev})/grub-mender-grubenv/mender_grubenv1/env mender_boot_part
+
+# Chainload to the appropriate partition's GRUB binary
+if [ "\${mender_boot_part}" = "4" ]; then
+    echo "BOOT: Chainloading to BOOT_A (mender_boot_part=4)"
+    search --no-floppy --set=root --label BOOT_A
+    chainloader /EFI/${distro_name}/${efi_binary_name}
+elif [ "\${mender_boot_part}" = "5" ]; then
+    echo "BOOT: Chainloading to BOOT_B (mender_boot_part=5)"
+    search --no-floppy --set=root --label BOOT_B
+    chainloader /EFI/${distro_name}/${efi_binary_name}
+else
+    echo "BOOT: Defaulting to BOOT_A (mender_boot_part=\${mender_boot_part})"
+    search --no-floppy --set=root --label BOOT_A
+    chainloader /EFI/${distro_name}/${efi_binary_name}
+fi
+boot
+EOF
+
+    # Copy chainloader config to fallback boot directory on BOOT
+    run_and_log_cmd "sudo cp work/boot_main/EFI/${distro_name}/grub.cfg work/boot_main/EFI/BOOT/grub.cfg"
+
+    # Copy the main grub.cfg to BOOT_A and BOOT_B
+    log_info "Copying main grub.cfg to BOOT_A and BOOT_B"
+    grub_cfg_found=false
+    if [ -f work/boot/grub.cfg ]; then
+        log_info "Found grub.cfg in work/boot/ (standalone mode)"
+        run_and_log_cmd "sudo cp work/boot/grub.cfg work/boot_a/EFI/${distro_name}/grub.cfg"
+        run_and_log_cmd "sudo cp work/boot/grub.cfg work/boot_b/EFI/${distro_name}/grub.cfg"
+        run_and_log_cmd "sudo cp work/boot/grub.cfg work/boot_a/EFI/BOOT/grub.cfg"
+        run_and_log_cmd "sudo cp work/boot/grub.cfg work/boot_b/EFI/BOOT/grub.cfg"
+        grub_cfg_found=true
+    elif [ -f work/boot/grub/grub.cfg ]; then
+        log_info "Found grub.cfg in work/boot/grub/ (grub.d mode)"
+        run_and_log_cmd "sudo cp work/boot/grub/grub.cfg work/boot_a/EFI/${distro_name}/grub.cfg"
+        run_and_log_cmd "sudo cp work/boot/grub/grub.cfg work/boot_b/EFI/${distro_name}/grub.cfg"
+        run_and_log_cmd "sudo cp work/boot/grub/grub.cfg work/boot_a/EFI/BOOT/grub.cfg"
+        run_and_log_cmd "sudo cp work/boot/grub/grub.cfg work/boot_b/EFI/BOOT/grub.cfg"
+        grub_cfg_found=true
+    elif [ -f work/boot/grub-mender-grubenv/grub.cfg ]; then
+        log_info "Found grub.cfg in work/boot/grub-mender-grubenv/"
+        run_and_log_cmd "sudo cp work/boot/grub-mender-grubenv/grub.cfg work/boot_a/EFI/${distro_name}/grub.cfg"
+        run_and_log_cmd "sudo cp work/boot/grub-mender-grubenv/grub.cfg work/boot_b/EFI/${distro_name}/grub.cfg"
+        run_and_log_cmd "sudo cp work/boot/grub-mender-grubenv/grub.cfg work/boot_a/EFI/BOOT/grub.cfg"
+        run_and_log_cmd "sudo cp work/boot/grub-mender-grubenv/grub.cfg work/boot_b/EFI/BOOT/grub.cfg"
+        grub_cfg_found=true
+    fi
+
+    if [ "$grub_cfg_found" = false ]; then
+        log_fatal "grub.cfg not found in any expected location (work/boot/grub.cfg, work/boot/grub/grub.cfg, work/boot/grub-mender-grubenv/grub.cfg)"
+    fi
+
+    # Use the reusable function to modify grub.cfg in both BOOT_A and BOOT_B
+    grub_modify_boot_partition_grubcfg "work/boot_a" "${distro_name}"
+    grub_modify_boot_partition_grubcfg "work/boot_b" "${distro_name}"
+
+    # Generate BOOT filesystem image (FAT32 with label "BOOT")
+    local boot_size_mb=${MENDER_BOOT_PART_SIZE_MB:-512}
+    log_info "Creating BOOT filesystem image (${boot_size_mb}MB, FAT32, label: BOOT)"
+    log_info "DEBUG: Contents of work/boot_main before creating image:"
+    run_and_log_cmd "sudo find work/boot_main -ls || true"
+    run_and_log_cmd "dd if=/dev/zero of=work/boot_main.img bs=1M count=${boot_size_mb}"
+    run_and_log_cmd "mkfs.vfat -F 32 -n BOOT work/boot_main.img"
+    run_and_log_cmd "mkdir -p work/esp_mount"
+    run_and_log_cmd "sudo mount work/boot_main.img work/esp_mount"
+    log_info "DEBUG: Copying to mounted image with rsync"
+    run_and_log_cmd "sudo rsync -av work/boot_main/ work/esp_mount/"
+    log_info "DEBUG: Contents of mounted BOOT image after rsync:"
+    run_and_log_cmd "sudo find work/esp_mount -ls || true"
+    run_and_log_cmd "sudo umount work/esp_mount"
+
+    # Generate BOOT_A filesystem image (FAT32 with label "BOOT_A")
+    local boot_a_size_mb=${MENDER_BOOT_A_PART_SIZE_MB:-100}
+    log_info "Creating BOOT_A filesystem image (${boot_a_size_mb}MB, FAT32, label: BOOT_A)"
+    run_and_log_cmd "dd if=/dev/zero of=work/boot_a.img bs=1M count=${boot_a_size_mb}"
+    run_and_log_cmd "mkfs.vfat -F 32 -n BOOT_A work/boot_a.img"
+    run_and_log_cmd "sudo mount work/boot_a.img work/esp_mount"
+    run_and_log_cmd "sudo rsync -a work/boot_a/ work/esp_mount/"
+    run_and_log_cmd "sudo umount work/esp_mount"
+
+    # Generate BOOT_B filesystem image (FAT32 with label "BOOT_B")
+    local boot_b_size_mb=${MENDER_BOOT_B_PART_SIZE_MB:-100}
+    log_info "Creating BOOT_B filesystem image (${boot_b_size_mb}MB, FAT32, label: BOOT_B)"
+    run_and_log_cmd "dd if=/dev/zero of=work/boot_b.img bs=1M count=${boot_b_size_mb}"
+    run_and_log_cmd "mkfs.vfat -F 32 -n BOOT_B work/boot_b.img"
+    run_and_log_cmd "sudo mount work/boot_b.img work/esp_mount"
+    run_and_log_cmd "sudo rsync -a work/boot_b/ work/esp_mount/"
+    run_and_log_cmd "sudo umount work/esp_mount"
+    run_and_log_cmd "rmdir work/esp_mount"
+
+    log_info "A/B boot partitions created successfully"
+    log_info "  - work/boot_main.img: BOOT partition (FAT32, label: BOOT)"
+    log_info "  - work/boot_a.img: BOOT_A partition (FAT32, label: BOOT_A)"
+    log_info "  - work/boot_b.img: BOOT_B partition (FAT32, label: BOOT_B)"
+
+    # Create slot tarball from BOOT_A contents for runtime boot partition updates
+    log_info "Creating boot partition slot tarball for Mender artifact updates"
+    run_and_log_cmd "cd work/boot_a && sudo tar -czf ../slot.tar.gz EFI/ && cd ../.."
+    run_and_log_cmd "sudo mkdir -p work/rootfs/usr/share/mender"
+    run_and_log_cmd "sudo install -m 644 work/slot.tar.gz work/rootfs/usr/share/mender/slot.tar.gz"
+    log_info "Boot partition slot tarball created at /usr/share/mender/slot.tar.gz"
+
+    # Generate ArtifactInstall state script from template with variable substitution
+    log_info "Generating ArtifactInstall state script for boot partition updates"
+
+    # Remove 'p' suffix from device base for boot disk (e.g., /dev/mmcblk0p -> /dev/mmcblk0)
+    local boot_disk_base="${MENDER_STORAGE_DEVICE_BASE%p}"
+
+    # Determine partition numbers for BOOT_A and BOOT_B
+    local boot_a_part_num=2
+    local boot_b_part_num=3
+
+    # Generate script from template using sed substitution (no .sh extension per Mender convention)
+    run_and_log_cmd "sed \
+        -e 's|@@BOOT_DISK@@|${boot_disk_base}|g' \
+        -e 's|@@BOOT_A_PART_NUM@@|${boot_a_part_num}|g' \
+        -e 's|@@BOOT_B_PART_NUM@@|${boot_b_part_num}|g' \
+        -e 's|@@ROOTFS_A_PART_NUM@@|${MENDER_ROOTFS_PART_A_NUMBER}|g' \
+        -e 's|@@ROOTFS_B_PART_NUM@@|${MENDER_ROOTFS_PART_B_NUMBER}|g' \
+        configs/mender_grub_state_scripts/ArtifactInstall_Leave_00_update_boot_part.template \
+        > work/ArtifactInstall_Leave_00_update_boot_part"
+
+    run_and_log_cmd "chmod 755 work/ArtifactInstall_Leave_00_update_boot_part"
+    log_info "ArtifactInstall state script generated and ready for artifact creation"
 }
 
 # grub_install_grub_editenv_binary

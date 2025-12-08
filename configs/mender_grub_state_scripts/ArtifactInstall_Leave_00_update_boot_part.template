@@ -1,0 +1,152 @@
+#!/bin/bash
+#
+# Copyright 2024 Northern.tech AS
+#
+#  Licensed under the Apache License, Version 2.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+#
+# Mender state script for A/B boot partition architecture with chainloader
+# This script runs during ArtifactInstall_Leave after the new rootfs has been written
+# to the inactive partition. It updates the inactive BOOT_A or BOOT_B partition.
+#
+# NOTE: This file is generated from a template with build-time variable substitution.
+#
+
+set -e
+
+# Values determined during image creation
+BOOT_DISK="@@BOOT_DISK@@"
+BOOT_A_PART_NUM="@@BOOT_A_PART_NUM@@"
+BOOT_B_PART_NUM="@@BOOT_B_PART_NUM@@"
+ROOTFS_A_PART_NUM="@@ROOTFS_A_PART_NUM@@"
+ROOTFS_B_PART_NUM="@@ROOTFS_B_PART_NUM@@"
+
+GRUB_EDITENV="/usr/bin/grub-mender-grubenv-print"
+SLOT_TARBALL="/usr/share/mender/slot.tar.gz"
+INACTIVE_MOUNT="/tmp/mender-inactive-rootfs"
+BOOT_MOUNT="/tmp/mender-boot-update"
+
+log_info() {
+    echo "[INFO] $*" >&2
+}
+
+log_warn() {
+    echo "[WARN] $*" >&2
+}
+
+log_error() {
+    echo "[ERROR] $*" >&2
+}
+
+# Update BOOT_A or BOOT_B partition with new slot contents from inactive rootfs
+update_boot_partition() {
+    local boot_part_num=$1
+    local tarball_source="${INACTIVE_MOUNT}${SLOT_TARBALL}"
+
+    if [ ! -f "${tarball_source}" ]; then
+        log_warn "Slot tarball not found at ${tarball_source}, skipping boot partition update"
+        return 0
+    fi
+
+    local boot_device="${BOOT_DISK}${boot_part_num}"
+    log_info "Updating boot partition ${boot_device} from ${tarball_source}"
+
+    # Mount boot partition
+    mkdir -p "${BOOT_MOUNT}"
+    if ! mount "${boot_device}" "${BOOT_MOUNT}"; then
+        log_error "Failed to mount boot partition ${boot_device}"
+        return 1
+    fi
+
+    # Ensure we unmount on exit
+    trap 'umount "${BOOT_MOUNT}" 2>/dev/null; rmdir "${BOOT_MOUNT}" 2>/dev/null' EXIT
+
+    # Remove old contents and extract new
+    log_info "Removing old boot partition contents"
+    rm -rf "${BOOT_MOUNT:?}/EFI"
+
+    log_info "Extracting new boot partition contents"
+    tar -xzf "${tarball_source}" -C "${BOOT_MOUNT}"
+    sync
+
+    log_info "Boot partition updated successfully"
+
+    # Cleanup
+    umount "${BOOT_MOUNT}"
+    rmdir "${BOOT_MOUNT}"
+    trap - EXIT
+}
+
+# Main execution
+main() {
+    log_info "Starting A/B boot partition update for Mender"
+
+    # Determine which partitions to update based on mender_boot_part
+    if [ ! -x "${GRUB_EDITENV}" ]; then
+        log_error "grub-mender-grubenv-print not found at ${GRUB_EDITENV}"
+        exit 1
+    fi
+
+    local boot_part=$(${GRUB_EDITENV} mender_boot_part 2>/dev/null)
+
+    local target_boot_part=""
+    local inactive_rootfs_part=""
+    case "$boot_part" in
+        mender_boot_part=${ROOTFS_A_PART_NUM})
+            # Currently booting from A, so update BOOT_A and get tarball from ROOTFS_A
+            target_boot_part="${BOOT_A_PART_NUM}"
+            inactive_rootfs_part="${BOOT_DISK}${ROOTFS_A_PART_NUM}"
+            ;;
+        mender_boot_part=${ROOTFS_B_PART_NUM})
+            # Currently booting from B, so update BOOT_B and get tarball from ROOTFS_B
+            target_boot_part="${BOOT_B_PART_NUM}"
+            inactive_rootfs_part="${BOOT_DISK}${ROOTFS_B_PART_NUM}"
+            ;;
+        *)
+            log_error "Unknown boot partition number: $boot_part"
+            exit 1
+            ;;
+    esac
+
+    log_info "Current boot part: $boot_part"
+    log_info "Target boot partition: $target_boot_part"
+    log_info "Inactive rootfs partition: $inactive_rootfs_part"
+
+    # Mount inactive rootfs partition to get the slot tarball
+    log_info "Mounting inactive partition $inactive_rootfs_part read-only at ${INACTIVE_MOUNT}"
+    mkdir -p "${INACTIVE_MOUNT}"
+    if ! mount -o ro "$inactive_rootfs_part" "${INACTIVE_MOUNT}"; then
+        log_error "Failed to mount inactive rootfs partition"
+        exit 1
+    fi
+
+    # Ensure we unmount inactive partition on exit
+    trap 'umount "${INACTIVE_MOUNT}" 2>/dev/null; rmdir "${INACTIVE_MOUNT}" 2>/dev/null' EXIT
+
+    # Update the inactive boot partition with tarball from inactive rootfs
+    update_boot_partition "${target_boot_part}"
+    if [ $? -ne 0 ]; then
+        log_error "Failed to update boot partition"
+        exit 1
+    fi
+
+    # Cleanup inactive partition mount
+    umount "${INACTIVE_MOUNT}"
+    rmdir "${INACTIVE_MOUNT}"
+    trap - EXIT
+
+    log_info "A/B boot partition update completed"
+}
+
+main
+
+exit 0

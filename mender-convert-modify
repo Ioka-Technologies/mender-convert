@@ -184,6 +184,11 @@ if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
         grub_install_standalone_grub_config
     fi
 
+    # Setup A/B ESP partitions with chainloader configs and shared BOOT partition
+    log_info "Setting up A/B ESP partition architecture..."
+    grub_setup_ab_esp_partitions
+
+    # Note: efibootmgr installation happens later in the package installation phase
 fi
 
 run_and_log_cmd "wget --quiet -O work/mender-data-dir.service $MENDER_CLIENT_DATA_DIR_SERVICE_URL"
@@ -332,6 +337,18 @@ fi
 
 if [ "${MENDER_INSTALL_INPUT_PACKAGES}" = "y" ]; then
     deb_get_and_install_input_package ${MENDER_INSTALL_INPUT_PACKAGES_PATH}
+fi
+
+# Install efibootmgr from system repositories for A/B ESP partition management
+if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
+    log_info "Installing efibootmgr for A/B ESP partition management"
+    if run_in_chroot_and_log_cmd_noexit "work/rootfs/" "env DEBIAN_FRONTEND=noninteractive apt-get install -y efibootmgr"; then
+        log_info "efibootmgr installed successfully"
+    else
+        log_warn "Failed to install efibootmgr from system repositories"
+        log_warn "The mender-efi-boot-init service will not be able to create NVRAM boot entries"
+        log_warn "System will still boot using UEFI fallback path (/EFI/BOOT/BOOT*.EFI)"
+    fi
 fi
 
 # Done with package installations.

@@ -297,6 +297,14 @@ disk_get_part_device() {
     echo "${part}"
 }
 
+disk_boot_a_part_device() {
+    disk_get_part_device "${MENDER_BOOT_A_PART_NUMBER}" "MENDER_BOOT_A_PART"
+}
+
+disk_boot_b_part_device() {
+    disk_get_part_device "${MENDER_BOOT_B_PART_NUMBER}" "MENDER_BOOT_B_PART"
+}
+
 disk_boot_part_device() {
     disk_get_part_device "${MENDER_BOOT_PART_NUMBER}" "MENDER_BOOT_PART"
 }
