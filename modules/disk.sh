@@ -115,6 +115,7 @@ disk_write_at_offset() {
 # $2 - destination file
 # $3 - image size in sectors
 # $4 - file system type, e.g ext4, xfs, ...
+# $5 - filesystem label (optional)
 disk_create_file_system_from_folder() {
     log_info "Creating a file-system image from: ${1}"
 
@@ -126,13 +127,19 @@ disk_create_file_system_from_folder() {
         *) EXTRA_OPTS="" ;;
     esac
 
+    # Add label option if provided
+    local label_opt=""
+    if [ -n "${5:-}" ]; then
+        label_opt="-L ${5}"
+    fi
+
     case "$4" in
         "ext4")
             MKFS_EXT4="/usr/bin/mkfs.ext4"
             if [ ! -f ${MKFS_EXT4} ]; then
                 MKFS_EXT4="/sbin/mkfs.ext4"
             fi
-            run_and_log_cmd "${MKFS_EXT4} -q -F ${2} ${EXTRA_OPTS}"
+            run_and_log_cmd "${MKFS_EXT4} -q -F ${label_opt} ${2} ${EXTRA_OPTS}"
             ;;
 
         "ext3")
@@ -140,7 +147,7 @@ disk_create_file_system_from_folder() {
             if [ ! -f ${MKFS_EXT3} ]; then
                 MKFS_EXT3="/sbin/mkfs.ext3"
             fi
-            run_and_log_cmd "${MKFS_EXT3} -q -F ${2} ${EXTRA_OPTS}"
+            run_and_log_cmd "${MKFS_EXT3} -q -F ${label_opt} ${2} ${EXTRA_OPTS}"
             ;;
 
         "xfs")
@@ -148,7 +155,7 @@ disk_create_file_system_from_folder() {
             if [ ! -f ${MKFS_XFS} ]; then
                 MKFS_XFS="/sbin/mkfs.xfs"
             fi
-            run_and_log_cmd "${MKFS_XFS} -q -f ${2} ${EXTRA_OPTS}"
+            run_and_log_cmd "${MKFS_XFS} -q -f ${label_opt} ${2} ${EXTRA_OPTS}"
             ;;
 
         "btrfs")
@@ -156,7 +163,7 @@ disk_create_file_system_from_folder() {
             if [ ! -f ${MKFS_BTRFS} ]; then
                 MKFS_BTRFS="/usr/sbin/mkfs.btrfs"
             fi
-            run_and_log_cmd "${MKFS_BTRFS} -q -f ${2} ${EXTRA_OPTS}"
+            run_and_log_cmd "${MKFS_BTRFS} -q -f ${label_opt} ${2} ${EXTRA_OPTS}"
             ;;
 
         *)

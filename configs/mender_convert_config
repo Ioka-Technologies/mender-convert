@@ -232,36 +232,23 @@ MENDER_GITHUB_ORG="https://github.com/mendersoftware"
 # Device file corresponding to the root filesystem partitions, without number.
 MENDER_STORAGE_DEVICE_BASE=/dev/mmcblk0p
 
-# Partition numbers differ based on whether A/B boot partitions are used
-# For A/B boot layout (GRUB EFI): BOOT=1, BOOT_A=2, BOOT_B=3, ROOT_A=4, ROOT_B=5, DATA=6
-# For traditional layout: BOOT=1, ROOT_A=2, ROOT_B=3, DATA=4
-
-# Boot A and Boot B partition numbers (only used with GRUB EFI A/B boot integration)
-MENDER_BOOT_A_PART_NUMBER="2"
-MENDER_BOOT_B_PART_NUMBER="3"
+# Partition layout: BOOT=1, ROOT_A=2, ROOT_B=3, DATA=4
+# This applies to both GRUB EFI and traditional U-Boot layouts
 
 # Partition number of boot partition
-# Note: For A/B boot layout, this is the main BOOT partition (partition 1) with chainloader
-# For traditional layout, this is partition 1
 MENDER_BOOT_PART_NUMBER="1"
 
 # Partition number of root filesystem A
-MENDER_ROOTFS_PART_A_NUMBER="4"
+MENDER_ROOTFS_PART_A_NUMBER="2"
 
 # Partition number of root filesystem B
-MENDER_ROOTFS_PART_B_NUMBER="5"
+MENDER_ROOTFS_PART_B_NUMBER="3"
 
 # Partition number of persistent data partition
-MENDER_DATA_PART_NUMBER="6"
+MENDER_DATA_PART_NUMBER="4"
 
 # Use partition uuids rather than device and partition numbers
 MENDER_ENABLE_PARTUUID="n"
-
-# Partition used as BOOT A (only for A/B boot architecture)
-MENDER_BOOT_A_PART=""
-
-# Partition used as BOOT B (only for A/B boot architecture)
-MENDER_BOOT_B_PART=""
 
 # Partition used as the boot partition.
 MENDER_BOOT_PART=""
@@ -376,20 +363,10 @@ mender_create_artifact() {
     log_info "Writing Mender artifact to: ${mender_artifact}"
     log_info "This can take up to 20 minutes depending on which compression method is used"
 
-    # Build mender-artifact command with optional state script for A/B boot architecture
-    local artifact_cmd="mender-artifact --compression ${MENDER_ARTIFACT_COMPRESSION} \
+    run_and_log_cmd "mender-artifact --compression ${MENDER_ARTIFACT_COMPRESSION} \
       write rootfs-image \
       --file work/rootfs.img \
       --output-path ${mender_artifact} \
       --artifact-name ${artifact_name} \
       ${all_device_types}"
-
-    # Add state script if using A/B boot partition architecture
-    if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ] && [ -f work/ArtifactInstall_Leave_00_update_boot_part ]; then
-        log_info "Adding ArtifactInstall state script for A/B boot partition updates"
-        artifact_cmd="${artifact_cmd} \
-      --script work/ArtifactInstall_Leave_00_update_boot_part"
-    fi
-
-    run_and_log_cmd "${artifact_cmd}"
 }

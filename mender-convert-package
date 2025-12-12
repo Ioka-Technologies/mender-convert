@@ -102,13 +102,12 @@ boot_part_sectors=$(disk_mb_to_sectors ${MENDER_BOOT_PART_SIZE_MB})
 data_part_sectors=$(disk_mb_to_sectors ${MENDER_DATA_PART_SIZE_MB})
 alignment_sectors=$((${MENDER_PARTITION_ALIGNMENT} / 512))
 
-if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
-    # A/B boot partitions: BOOT (512MB), BOOT_A (100MB), BOOT_B (100MB)
-    boot_a_part_sectors=$(disk_mb_to_sectors ${MENDER_BOOT_A_PART_SIZE_MB:-100})
-    boot_b_part_sectors=$(disk_mb_to_sectors ${MENDER_BOOT_B_PART_SIZE_MB:-100})
+# Boot partition starts at alignment boundary
+boot_part_start=${alignment_sectors}
 
-    boot_part_start=${alignment_sectors}
-    overhead_sectors=$((${alignment_sectors} * 6))  # Increased for 3 boot-related partitions
+if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
+    # GRUB EFI with A/B rootfs partitions (4 partitions: BOOT, ROOT_A, ROOT_B, DATA)
+    overhead_sectors=$((${alignment_sectors} * 5))
 else
     # The two first blocks are typically reserved for U-boot environment.
     boot_part_start=$((${alignment_sectors} * 3))
@@ -142,15 +141,9 @@ fi
 boot_part_sectors=$(disk_align_sectors ${boot_part_sectors} ${MENDER_PARTITION_ALIGNMENT})
 
 # Calculate rootfs size
-if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
-    # For A/B boot: subtract BOOT, BOOT_A, and BOOT_B partitions
-    rootfs_part_sectors=$(((${disk_image_total_sectors} - ${data_part_sectors} - \
-        ${boot_a_part_sectors} - ${boot_b_part_sectors} - ${boot_part_sectors} - ${overhead_sectors}) / 2))
-else
-    # For U-Boot: subtract only BOOT partition
-    rootfs_part_sectors=$(((${disk_image_total_sectors} - ${data_part_sectors} - \
-        ${boot_part_sectors} - ${overhead_sectors}) / 2))
-fi
+# For both GRUB EFI and U-Boot: subtract BOOT partition and overhead
+rootfs_part_sectors=$(((${disk_image_total_sectors} - ${data_part_sectors} - \
+    ${boot_part_sectors} - ${overhead_sectors}) / 2))
 
 # Make sure rootfs size is aligned to MENDER_PARTITION_ALIGNMENT
 rootfs_part_sectors=$(disk_align_sectors ${rootfs_part_sectors} ${MENDER_PARTITION_ALIGNMENT})
@@ -232,6 +225,7 @@ if [[ "${MENDER_CLIENT_INSTALL}" == y ]]; then
     fi
 fi
 
+# Create single rootfs image (no label - partitions identified by partition number)
 disk_create_file_system_from_folder "work/rootfs/" "work/rootfs.img" \
     "${rootfs_image_sectors}" "${image_fs_type}"
 
@@ -268,58 +262,26 @@ img_path="deploy/${image_name}.img"
 run_and_log_cmd \
     "dd if=/dev/zero of=${img_path} bs=512 count=0 seek=${disk_image_total_sectors} status=none"
 
-# Calculate partition layout based on integration type
-if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
-    # A/B boot partition layout: BOOT, BOOT_A, BOOT_B, ROOT_A, ROOT_B, DATA
-    log_info "Total disk size: $(disk_sectors_to_mb ${disk_image_total_sectors}) MiB"
-    log_info "  BOOT partition    $(disk_sectors_to_mb ${boot_part_sectors}) MiB"
-    log_info "  BOOT_A partition  $(disk_sectors_to_mb ${boot_a_part_sectors}) MiB"
-    log_info "  BOOT_B partition  $(disk_sectors_to_mb ${boot_b_part_sectors}) MiB"
-    log_info "  RootFS partitions $(disk_sectors_to_mb ${rootfs_part_sectors}) MiB x 2"
-    log_info "  Data partition    $(disk_sectors_to_mb ${data_part_sectors}) MiB"
+# Calculate partition layout (4 partitions: BOOT, ROOT_A, ROOT_B, DATA)
+log_info "Total disk size: $(disk_sectors_to_mb ${disk_image_total_sectors}) MiB"
+log_info "  BOOT partition    $(disk_sectors_to_mb ${boot_part_sectors}) MiB"
+log_info "  RootFS partitions $(disk_sectors_to_mb ${rootfs_part_sectors}) MiB x 2"
+log_info "  Data partition    $(disk_sectors_to_mb ${data_part_sectors}) MiB"
 
-    # BOOT is partition 1 (FAT32)
-    boot_main_start=${boot_part_start}
-    boot_main_end=$((${boot_main_start} + ${boot_part_sectors} - 1))
+# BOOT is partition 1 (FAT32)
+boot_part_end=$((${boot_part_start} + ${boot_part_sectors} - 1))
 
-    # BOOT_A is partition 2 (FAT32)
-    boot_a_start=$(disk_align_sectors ${boot_main_end} ${MENDER_PARTITION_ALIGNMENT})
-    boot_a_end=$((${boot_a_start} + ${boot_a_part_sectors} - 1))
+# ROOT_A is partition 2
+rootfsa_start=$(disk_align_sectors ${boot_part_end} ${MENDER_PARTITION_ALIGNMENT})
+rootfsa_end=$((${rootfsa_start} + ${rootfs_part_sectors} - 1))
 
-    # BOOT_B is partition 3 (FAT32)
-    boot_b_start=$(disk_align_sectors ${boot_a_end} ${MENDER_PARTITION_ALIGNMENT})
-    boot_b_end=$((${boot_b_start} + ${boot_b_part_sectors} - 1))
+# ROOT_B is partition 3
+rootfsb_start=$(disk_align_sectors ${rootfsa_end} ${MENDER_PARTITION_ALIGNMENT})
+rootfsb_end=$((${rootfsb_start} + ${rootfs_part_sectors} - 1))
 
-    # ROOT A is partition 4
-    rootfsa_start=$(disk_align_sectors ${boot_b_end} ${MENDER_PARTITION_ALIGNMENT})
-    rootfsa_end=$((${rootfsa_start} + ${rootfs_part_sectors} - 1))
-
-    # ROOT B is partition 5
-    rootfsb_start=$(disk_align_sectors ${rootfsa_end} ${MENDER_PARTITION_ALIGNMENT})
-    rootfsb_end=$((${rootfsb_start} + ${rootfs_part_sectors} - 1))
-
-    # DATA is partition 6
-    data_start=$(disk_align_sectors ${rootfsb_end} ${MENDER_PARTITION_ALIGNMENT})
-    data_end=$((${data_start} + ${data_part_sectors} - 1))
-else
-    # Traditional U-Boot layout: BOOT, ROOT_A, ROOT_B, DATA
-    log_info "Total disk size: $(disk_sectors_to_mb ${disk_image_total_sectors}) MiB"
-    log_info "  Boot partition    $(disk_sectors_to_mb ${boot_part_sectors}) MiB"
-    log_info "  RootFS partitions $(disk_sectors_to_mb ${rootfs_part_sectors}) MiB x 2"
-    log_info "  Data partition    $(disk_sectors_to_mb ${data_part_sectors}) MiB"
-
-    # boot_part_start is defined at the beginning of this file
-    boot_part_end=$((${boot_part_start} + ${boot_part_sectors} - 1))
-
-    rootfsa_start=$(disk_align_sectors ${boot_part_end} ${MENDER_PARTITION_ALIGNMENT})
-    rootfsa_end=$((${rootfsa_start} + ${rootfs_part_sectors} - 1))
-
-    rootfsb_start=$(disk_align_sectors ${rootfsa_end} ${MENDER_PARTITION_ALIGNMENT})
-    rootfsb_end=$((${rootfsb_start} + ${rootfs_part_sectors} - 1))
-
-    data_start=$(disk_align_sectors ${rootfsb_end} ${MENDER_PARTITION_ALIGNMENT})
-    data_end=$((${data_start} + ${data_part_sectors} - 1))
-fi
+# DATA is partition 4
+data_start=$(disk_align_sectors ${rootfsb_end} ${MENDER_PARTITION_ALIGNMENT})
+data_end=$((${data_start} + ${data_part_sectors} - 1))
 
 if [ -n "${MENDER_PARTITION_SCHEME}" ]; then
     # Force partition scheme to the one from configs
@@ -331,57 +293,40 @@ else
     log_info "Using input diskimage partition scheme (${partition_scheme})"
 fi
 
-# Create partition table.
+# Create partition table (4 partitions: BOOT, ROOT_A, ROOT_B, DATA)
 if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
-    # A/B boot partition layout
     if [ "${partition_scheme}" == "gpt" ]; then
-        log_info "Writing GPT partition table with A/B boot partitions"
+        log_info "Writing GPT partition table"
         run_and_log_cmd "${PARTED} -s ${img_path} mklabel gpt"
 
-        # Partition 1: BOOT (FAT32)
-        run_and_log_cmd "${PARTED} -s ${img_path} unit s mkpart BOOT fat32 ${boot_main_start} ${boot_main_end}"
+        # Partition 1: BOOT (FAT32 with chainloader)
+        run_and_log_cmd "${PARTED} -s ${img_path} unit s mkpart BOOT fat32 ${boot_part_start} ${boot_part_end}"
         run_and_log_cmd "${PARTED} -s ${img_path} set 1 boot on"
         run_and_log_cmd "${PARTED} -s ${img_path} set 1 esp on"
 
-        # Partition 2: BOOT_A (FAT32)
-        run_and_log_cmd "${PARTED} -s ${img_path} unit s mkpart BOOT_A fat32 ${boot_a_start} ${boot_a_end}"
-        run_and_log_cmd "${PARTED} -s ${img_path} set 2 boot on"
-        run_and_log_cmd "${PARTED} -s ${img_path} set 2 esp on"
-
-        # Partition 3: BOOT_B (FAT32)
-        run_and_log_cmd "${PARTED} -s ${img_path} unit s mkpart BOOT_B fat32 ${boot_b_start} ${boot_b_end}"
-        run_and_log_cmd "${PARTED} -s ${img_path} set 3 boot on"
-        run_and_log_cmd "${PARTED} -s ${img_path} set 3 esp on"
-
-        # Partition 4: ROOT A
+        # Partition 2: ROOT_A (ext4 with EFI folder and rootfs)
         run_and_log_cmd "${PARTED} -s ${img_path} -- unit s mkpart ROOT_A ext4 ${rootfsa_start} ${rootfsa_end}"
 
-        # Partition 5: ROOT B
+        # Partition 3: ROOT_B (ext4 with EFI folder and rootfs)
         run_and_log_cmd "${PARTED} -s ${img_path} -- unit s mkpart ROOT_B ext4 ${rootfsb_start} ${rootfsb_end}"
 
-        # Partition 6: DATA
+        # Partition 4: DATA
         run_and_log_cmd "${PARTED} -s ${img_path} -- unit s mkpart DATA ext4 ${data_start} ${data_end}"
     else
-        log_info "Writing DOS (MBR) partition table with A/B boot partitions"
+        log_info "Writing DOS (MBR) partition table"
         run_and_log_cmd "${PARTED} -s ${img_path} mklabel msdos"
 
-        # Partition 1: BOOT (FAT32)
-        run_and_log_cmd "${PARTED} -s ${img_path} unit s mkpart primary fat32 ${boot_main_start} ${boot_main_end}"
+        # Partition 1: BOOT (FAT32 with chainloader)
+        run_and_log_cmd "${PARTED} -s ${img_path} unit s mkpart primary fat32 ${boot_part_start} ${boot_part_end}"
         run_and_log_cmd "${PARTED} -s ${img_path} set 1 boot on"
 
-        # Partition 2: BOOT_A (FAT32)
-        run_and_log_cmd "${PARTED} -s ${img_path} unit s mkpart primary fat32 ${boot_a_start} ${boot_a_end}"
-
-        # Partition 3: BOOT_B (FAT32)
-        run_and_log_cmd "${PARTED} -s ${img_path} unit s mkpart primary fat32 ${boot_b_start} ${boot_b_end}"
-
-        # Partition 4: ROOT A
+        # Partition 2: ROOT_A (ext4 with EFI folder and rootfs)
         run_and_log_cmd "${PARTED} -s ${img_path} -- unit s mkpart primary ext4 ${rootfsa_start} ${rootfsa_end}"
 
-        # Partition 5: ROOT B
+        # Partition 3: ROOT_B (ext4 with EFI folder and rootfs)
         run_and_log_cmd "${PARTED} -s ${img_path} -- unit s mkpart primary ext4 ${rootfsb_start} ${rootfsb_end}"
 
-        # Partition 6: DATA
+        # Partition 4: DATA
         run_and_log_cmd "${PARTED} -s ${img_path} -- unit s mkpart primary ext4 ${data_start} ${data_end}"
     fi
 else
@@ -445,32 +390,23 @@ fi
 run_and_log_cmd "sudo umount -f work/boot"
 run_and_log_cmd "sudo umount -f work/rootfs"
 
-# Burn Partitions
+# Burn Partitions (4 partitions: BOOT, ROOT_A, ROOT_B, DATA)
 if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
-    # A/B boot partition layout: write BOOT, BOOT_A, BOOT_B, ROOT_A, ROOT_B, DATA
-    log_info "Writing BOOT partition image"
-    disk_write_at_offset "work/boot_main.img" "${img_path}" "${boot_main_start}"
-    log_info "Writing BOOT_A partition image"
-    disk_write_at_offset "work/boot_a.img" "${img_path}" "${boot_a_start}"
-    log_info "Writing BOOT_B partition image"
-    disk_write_at_offset "work/boot_b.img" "${img_path}" "${boot_b_start}"
-    log_info "Writing rootfsa partition image"
-    disk_write_at_offset "${output_dir}/rootfs.img" "${img_path}" "${rootfsa_start}"
-    log_info "Writing rootfsb partition image"
-    disk_write_at_offset "${output_dir}/rootfs.img" "${img_path}" "${rootfsb_start}"
-    log_info "Writing data partition image"
-    disk_write_at_offset "${output_dir}/data.img" "${img_path}" "${data_start}"
+    log_info "Writing BOOT partition image (chainloader)"
+    disk_write_at_offset "work/boot_main.img" "${img_path}" "${boot_part_start}"
 else
-    # Traditional U-Boot layout: write BOOT, ROOT_A, ROOT_B, DATA
-    log_info "Writing boot partition image"
+    log_info "Writing BOOT partition image"
     disk_write_at_offset "${boot_part}" "${img_path}" "${boot_part_start}"
-    log_info "Writing rootfsa partition image"
-    disk_write_at_offset "${output_dir}/rootfs.img" "${img_path}" "${rootfsa_start}"
-    log_info "Writing rootfsb partition image"
-    disk_write_at_offset "${output_dir}/rootfs.img" "${img_path}" "${rootfsb_start}"
-    log_info "Writing data partition image"
-    disk_write_at_offset "${output_dir}/data.img" "${img_path}" "${data_start}"
 fi
+
+log_info "Writing ROOT_A partition image (partition 2 with /EFI folder)"
+disk_write_at_offset "${output_dir}/rootfs.img" "${img_path}" "${rootfsa_start}"
+
+log_info "Writing ROOT_B partition image (partition 3 with /EFI folder)"
+disk_write_at_offset "${output_dir}/rootfs.img" "${img_path}" "${rootfsb_start}"
+
+log_info "Writing DATA partition image"
+disk_write_at_offset "${output_dir}/data.img" "${img_path}" "${data_start}"
 
 log_info "Performing platform specific package operations (if any)"
 for hook in "${PLATFORM_PACKAGE_HOOKS[@]}"; do
@@ -543,16 +479,6 @@ testscfg_add "MENDER_DATA_PART" "${data_part_device}"
 testscfg_add "MENDER_BOOT_PART_MOUNT_LOCATION" "${MENDER_BOOT_PART_MOUNT_LOCATION}"
 testscfg_add "MENDER_BOOT_PART_SIZE_MB" "$(disk_sectors_to_mb ${boot_part_sectors})"
 testscfg_add "MENDER_DATA_PART_SIZE_MB" "${MENDER_DATA_PART_SIZE_MB}"
-
-# Add boot partition info for A/B boot architecture
-if [ "${MENDER_GRUB_EFI_INTEGRATION}" == "y" ]; then
-    boot_a_part_device=$(disk_boot_a_part_device)
-    boot_b_part_device=$(disk_boot_b_part_device)
-    testscfg_add "MENDER_BOOT_A_PART" "${boot_a_part_device}"
-    testscfg_add "MENDER_BOOT_B_PART" "${boot_b_part_device}"
-    testscfg_add "MENDER_BOOT_A_PART_SIZE_MB" "$(disk_sectors_to_mb ${boot_a_part_sectors})"
-    testscfg_add "MENDER_BOOT_B_PART_SIZE_MB" "$(disk_sectors_to_mb ${boot_b_part_sectors})"
-fi
 
 testscfg_add "MENDER_DEVICE_TYPE" "${device_type}"
 testscfg_add "MENDER_PARTITIONING_OVERHEAD_KB" "$(((${overhead_sectors} * 512) / 1024))"
